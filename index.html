@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
-  <title>Cryo Pipe Cool-down Simulator</title>
+  <title>Cryo Interactive + Flow Ramp + Pressure</title>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
     body{font-family:system-ui, sans-serif; margin:2rem; background:#f7f7f7;}
@@ -15,17 +15,16 @@
   </style>
 </head>
 <body>
-  <h1>Cryogenic Pipe Cool-down Simulator</h1>
+  <h1>Cryo Pipe + Auto-Ramp N₂ Flow + Pressure</h1>
   <div id="errors"></div>
 
-  <!-- ===== INPUTS ===== -->
+  <!-- ===== GEOMETRY & PROCESS ===== -->
   <label>Pipe length (m)          <input id="L"       type="number" value="100"></label>
   <label>Outer diameter (mm)      <input id="OD"      type="number" value="168"></label>
   <label>Wall thickness (mm)      <input id="t"       type="number" value="3.4"></label>
   <label>Initial temp (°C)        <input id="T0"      type="number" value="20"></label>
   <label>Target temp (°C)         <input id="Ttarget" type="number" value="-150"></label>
   <label>N₂ inlet temp (°C)       <input id="TN2"     type="number" value="-196"></label>
-  <label>N₂ flow (Nm³/h)          <input id="VN2"     type="number" value="1000"></label>
   <label>Ambient temp (°C)        <input id="Tamb"    type="number" value="20"></label>
   <label>Overall U-value (W/m²K)  <input id="U"       type="number" value="1.0"></label>
   <label>Efficiency (%)           <input id="eta"     type="number" value="70" min="1" max="100"></label>
@@ -34,7 +33,7 @@
   <fieldset>
     <legend>Run control</legend>
     <label>Step size (s) <input id="stepSize" type="number" value="10" min="1" max="300"></label>
-    <label>Playback speed
+    <label>Speed
       <input id="speed" type="range" min="10" max="400" value="100">
       <span id="speedLbl">1×</span>
     </label>
@@ -43,28 +42,25 @@
     <button id="resetBtn">⏹ Reset</button>
   </fieldset>
 
-  <!-- ===== OUTPUT ===== -->
   <div id="results">Press Reset to initialise</div>
   <canvas id="chart"></canvas>
 
-  <!-- ===== Chart.js CDN ===== -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-
-  <!-- ===== APPLICATION ===== -->
   <script>
-    // ---------- constants ----------
-    const RHO_STEEL = 8000;          // kg/m³
-    const RHO_N2    = 1.250;         // kg/Nm³  (0 °C, 1 atm)
-    const CP_N2     = 1040;          // J/kgK
+    // --------- phys constants ---------
+    const RHO_STEEL = 8000;           // kg/m³
+    const RHO_N2    = 1.250;          // kg/Nm³
+    const CP_N2     = 1040;           // J/kgK
     const DEG_2_K   = 273.15;
+    const R         = 8.314;          // J/mol·K
 
-    // ---------- steel Cp ----------
+    // --------- steel Cp ---------
     function CpSteel(TK){
       const t = TK/100;
       return 100*(2.716 + 9.146*t - 14.08*t*t + 9.369*t*t*t - 1.916*t*t*t*t);
     }
 
-    // ---------- DOM ----------
+    // --------- DOM ---------
     const $ = id=>document.getElementById(id);
     function read(id){
       const v = parseFloat($(id).value);
@@ -72,43 +68,70 @@
       return v;
     }
 
-    // ---------- simulation ----------
+    // --------- flow-rate ramp algorithm ---------
+    function flowRate(TpipeC){
+      if(TpipeC > -10) return 1000;                       // stage 1
+      if(TpipeC > -80) return Math.min(5000,  1000 + 1000*Math.floor((-10 - TpipeC)/10));
+      if(TpipeC > -110)return 5000;                       // stage 3
+      return 10000;                                       // stage 4 preserve
+    }
+
+    // --------- simulation ---------
     class Sim{
       constructor(){
-        this.tStep = read('stepSize');
-        this.time  = 0;
-        this.Tpipe = read('T0') + DEG_2_K;
-        this.Ttarget = read('Ttarget') + DEG_2_K;
-        this.Tn2   = read('TN2')  + DEG_2_K;
-        this.Tamb  = read('Tamb') + DEG_2_K;
-        this.U     = read('U');
-        this.eta   = read('eta')/100;
-        this.VN2_h = read('VN2');
-        this.mDotN2= (this.VN2_h * RHO_N2)/3600;
+        this.tStep  = read('stepSize');
+        this.time   = 0;
+        this.Tpipe  = read('T0') + DEG_2_K;
+        this.Ttarget= read('Ttarget') + DEG_2_K;
+        this.Tn2    = read('TN2')  + DEG_2_K;
+        this.Tamb   = read('Tamb') + DEG_2_K;
+        this.U      = read('U');
+        this.eta    = read('eta')/100;
 
         const L=read('L'), OD=read('OD')*1e-3, t=read('t')*1e-3, ID=OD-2*t;
         if(ID<=0) throw new Error('Negative inner diameter');
         const Asteel = Math.PI/4*(OD*OD - ID*ID);
         this.mSteel = Asteel * L * RHO_STEEL;
         this.Aouter = Math.PI * OD * L;
+        this.Vpipe  = Math.PI/4*ID*ID*L;   // m³
 
-        this.series = {time:[0], temp:[this.Tpipe - DEG_2_K]};
-        this.running= false;
-        this.raf    = null;
+        this.series = {
+          time:  [0],
+          temp:  [this.Tpipe - DEG_2_K],
+          flow:  [flowRate(this.Tpipe - DEG_2_K)],
+          press: [0]
+        };
+        this.molesN2 = 0;   // integrated
+        this.running = false;
+        this.raf     = null;
       }
       step(){
         if(this.Tpipe <= this.Ttarget) return false;
+        const TpipeC = this.Tpipe - DEG_2_K;
+        const VN2_h  = flowRate(TpipeC);
+        const mDotN2 = (VN2_h * RHO_N2)/3600;   // kg/s
         const cp = CpSteel(this.Tpipe);
-        const Qcool = this.mDotN2 * CP_N2 * (this.Tpipe - this.Tn2) * this.eta;
+        const Qcool = mDotN2 * CP_N2 * (this.Tpipe - this.Tn2) * this.eta;
         const Qingress = this.U * this.Aouter * (this.Tamb - this.Tpipe);
         const Qnet = Qcool - Qingress;
         if(Qnet <= 0) throw new Error('Stall: heat ingress ≥ cooling power');
+
         const dE = Qnet * this.tStep;
         const dT = dE / (this.mSteel * cp);
         this.Tpipe -= dT;
         this.time  += this.tStep;
+
+        // moles injected this step
+        const molStep = (mDotN2 * this.tStep) / 0.028;  // kg → mol (28 g/mol)
+        this.molesN2 += molStep;
+        // ideal-gas pressure (T in K, V in m³ → Pa)
+        const P_pa = (this.molesN2 * R * this.Tpipe) / this.Vpipe;
+        const P_bar = P_pa / 1e5;
+
         this.series.time.push(this.time/3600);
         this.series.temp.push(this.Tpipe - DEG_2_K);
+        this.series.flow.push(VN2_h);
+        this.series.press.push(P_bar);
         return true;
       }
       play(){
@@ -119,8 +142,11 @@
           if(!this.running) return;
           for(let i=0;i<spd;i++) this.step();
           updateChart(this.series);
-          $('results').textContent =
-            `Time: ${(this.time/3600).toFixed(2)} h | Temp: ${(this.Tpipe-DEG_2_K).toFixed(1)} °C`;
+          $('results').innerHTML =
+            `Time: ${(this.time/3600).toFixed(2)} h<br>` +
+            `Temp: ${(this.Tpipe-DEG_2_K).toFixed(1)} °C<br>` +
+            `Flow: ${this.series.flow[this.series.flow.length-1]} Nm³/h<br>` +
+            `Pressure: ${this.series.press[this.series.press.length-1].toFixed(2)} bar`;
           if(this.Tpipe <= this.Ttarget){ this.pause(); return; }
           this.raf = requestAnimationFrame(tick);
         };
@@ -129,7 +155,6 @@
       pause(){ this.running=false; cancelAnimationFrame(this.raf); }
       reset(){
         this.pause();
-        // rebuild completely
         const oldStep = read('stepSize');
         const oldSpeed= $('speed').value;
         Object.assign(this, new Sim());
@@ -137,47 +162,46 @@
         $('speed').value    = oldSpeed;
         $('speedLbl').textContent = (oldSpeed/100).toFixed(1)+'×';
         updateChart(this.series);
-        $('results').textContent = 'Ready – press Play';
+        $('results').innerHTML = 'Ready – press Play';
       }
     }
 
-    // ---------- chart ----------
+    // --------- chart ----------
     let chart;
-    function updateChart(series){
+    function updateChart(s){
       const ctx = $('chart');
       if(chart) chart.destroy();
       chart = new Chart(ctx,{
         type:'line',
         data:{
-          labels:series.time,
-          datasets:[{
-            label:'Pipe temp (°C)',
-            data:series.temp,
-            borderColor:'#005faf',
-            fill:false,
-            tension:0.2,
-            pointRadius:0
-          }]
+          labels:s.time,
+          datasets:[
+            {label:'Pipe temp (°C)', data:s.temp,  borderColor:'#005faf', fill:false, tension:0.2, pointRadius:0, yAxisID:'y'},
+            {label:'N₂ flow (Nm³/h)',data:s.flow, borderColor:'#e70',    fill:false, tension:0.2, pointRadius:0, yAxisID:'y1'},
+            {label:'Pressure (bar)', data:s.press,borderColor:'#080',    fill:false, tension:0.2, pointRadius:0, yAxisID:'y2'}
+          ]
         },
         options:{
           animation:false,
           plugins:{legend:{display:true}},
           scales:{
             x:{title:{display:true,text:'Time (h)'}},
-            y:{title:{display:true,text:'Temperature (°C)'}}
+            y:{type:'linear', display:true, position:'left',  title:{display:true,text:'Temp (°C)'},},
+            y1:{type:'linear', display:true, position:'right', title:{display:true,text:'Flow (Nm³/h)'}, grid:{drawOnChartArea:false},},
+            y2:{type:'linear', display:false, position:'right', title:{display:true,text:'Pressure (bar)'}, grid:{drawOnChartArea:false},}
           }
         }
       });
     }
 
-    // ---------- controls ----------
+    // --------- controls ----------
     let sim;
     $('resetBtn').onclick = ()=> { sim = new Sim(); };
     $('playBtn').onclick  = ()=> { if(!sim) sim=new Sim(); sim.play(); };
     $('pauseBtn').onclick = ()=> { if(sim) sim.pause(); };
     $('speed').oninput    = ()=> $('speedLbl').textContent = ($('speed').value/100).toFixed(1)+'×';
 
-    // ---------- start ----------
+    // --------- start ----------
     sim = new Sim();
   </script>
 </body>
