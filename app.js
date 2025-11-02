@@ -106,3 +106,114 @@ function runCalculation(){
   `;
   plot(series);
 }
+// ---------- global simulation state ----------
+let sim = null;          // active simulation object
+let animFrame = null;    // requestAnimationFrame handle
+
+// ---------- DOM hooks ----------
+const playBtn  = document.getElementById('playBtn');
+const resetBtn = document.getElementById('resetBtn');
+const speedSl  = document.getElementById('speed');
+const speedLbl = document.getElementById('speedVal');
+const stepSl   = document.getElementById('stepSize');
+
+playBtn.onclick  = ()=> togglePlay();
+resetBtn.onclick = ()=> resetSim();
+speedSl.oninput  = ()=> speedLbl.textContent = (speedSl.value/50).toFixed(1)+'×';
+
+// ---------- simulation class ----------
+class CooldownSim{
+  constructor(inputs){
+    this.inputs = inputs;
+    this.tStep  = parseInt(stepSl.value);
+    this.time   = 0;                       // seconds
+    this.Tpipe  = inputs.T0_K;
+    this.series = {time:[0], temp:[inputs.T0_C]};
+    this.QnetArr= [0];
+    this.idx    = 0;                       // current playback index
+    this.running= false;
+    this._preCompute();
+  }
+  _preCompute(){
+    const {L,OD_mm,t_mm} = this.inputs;
+    const OD = OD_mm*1e-3, t = t_mm*1e-3, ID = OD - 2*t;
+    this.mSteel = Math.PI/4*(OD*OD - ID*ID)*L*8000;
+    this.Aouter = Math.PI*OD*L;
+    this.mDotN2 = (this.inputs.VN2_h*1.250)/3600;
+  }
+  // advance physics by one tStep
+  step(){
+    if(this.Tpipe <= this.inputs.Ttarget_K) return false; // finished
+    const TK = this.Tpipe;
+    const Cp = CpSteel(TK);
+    const Qcool = this.mDotN2 * 1040 * (TK - this.inputs.TN2_K) * this.inputs.eta;
+    const Qingress = this.inputs.U * this.Aouter * (this.inputs.Tamb_K - TK);
+    const Qnet = Qcool - Qingress;
+    if(Qnet <=0) throw new Error('Stall detected');
+    const dE = Qnet * this.tStep;
+    const dT = dE / (this.mSteel * Cp);
+    this.Tpipe -= dT;
+    this.time  += this.tStep;
+    this.series.time.push(this.time/3600);
+    this.series.temp.push(this.Tpipe - 273.15);
+    this.QnetArr.push(Qnet);
+    return true;
+  }
+  // run until user pauses or target reached
+  play(){
+    if(this.running) return;
+    this.running = true;
+    const speed = speedSl.value/50;   // 0→4×
+    const tick = ()=>{
+      if(!this.running) return;
+      for(let i=0;i<Math.max(1,Math.round(speed));i++) this.step();
+      plotLive(this.series);
+      updateResults(this);
+      if(this.Tpipe <= this.inputs.Ttarget_K){ pause(); return;}
+      animFrame = requestAnimationFrame(tick);
+    };
+    tick();
+  }
+  pause(){ this.running=false; cancelAnimationFrame(animFrame);}
+  reset(){
+    this.pause();
+    this.time=0; this.Tpipe=this.inputs.T0_K;
+    this.series={time:[0],temp:[this.inputs.T0_C]};
+    this.QnetArr=[0];
+    plotLive(this.series);
+    updateResults(this);
+  }
+}
+
+// ---------- control ----------
+function togglePlay(){
+  if(!sim) resetSim();
+  sim.running ? sim.pause() : sim.play();
+  playBtn.textContent = sim.running ? '❚❚ Pause' : '▶ Play';
+}
+function pause(){ if(sim){sim.pause(); playBtn.textContent='▶ Play';}}
+function resetSim(){
+  pause();
+  const inputs = getInputs();          // reuse old validation
+  sim = new CooldownSim(inputs);
+  plotLive(sim.series);
+  updateResults(sim);
+}
+
+// ---------- helpers ----------
+function getInputs(){
+  // reuse your old read() helpers, convert to K, etc.
+  const T0_C=read('T0'), Tt_C=read('Ttarget'), TN2_C=read('TN2'), Tamb_C=read('Tamb');
+  return {
+    L:read('L'), OD_mm:read('OD'), t_mm:read('t'),
+    T0_K:T0_C+273.15, Ttarget_K:Tt_C+273.15, TN2_K:TN2_C+273.15, Tamb_K:Tamb_C+273.15,
+    VN2_h:read('VN2'), U:read('U'), eta:read('eta')/100
+  };
+}
+function updateResults(sim){
+  const res=document.getElementById('results');
+  res.innerHTML=`
+    <b>Live</b> – Time: ${(sim.time/3600).toFixed(2)} h |
+    Temp: ${(sim.Tpipe-273.15).toFixed(1)} °C |
+    Step: ${sim.tStep} s`;
+}
