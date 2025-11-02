@@ -30,7 +30,21 @@
   <label>Ambient temp (°C)<input id="Tamb"  type="number" value="20" step="1"></label>
   <label>Overall U-value (W/m²K)<input id="U" type="number" value="1.0" step="0.1"></label>
   <label>Heat-exchange efficiency %<input id="eta" type="number" value="70" step="1" min="1" max="100"></label>
+<!-- add directly under the existing inputs -->
+<fieldset>
+  <legend>Interactive run</legend>
+  <label>Step size (s)<input id="stepSize" type="number" value="10" min="1" max="300"></label>
+  <label>Playback speed
+        <input id="speed" type="range" min="0" max="200" value="50">
+        <span id="speedVal">1×</span></label>
+  <button id="playBtn">▶ Play</button>
+  <button id="resetBtn">⏹ Reset</button>
+</fieldset>
 
+<!-- we keep the old “Run calculation” button for a single-shot -->
+<hr>
+<div id="results"></div>
+<canvas id="chart"></canvas>
   <button id="run">Run calculation</button>
 
   <div id="results"></div>
