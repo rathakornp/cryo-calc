@@ -2,54 +2,183 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
-  <title>Cryo-Pipe Cool-down Calculator</title>
+  <title>Cryo Pipe Cool-down Simulator</title>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
     body{font-family:system-ui, sans-serif; margin:2rem; background:#f7f7f7;}
-    h1{margin-top:0}
-    label{display:block; margin:.5rem 0 .2rem;}
-    input[type=number]{width:8rem; padding:.3rem;}
-    button{padding:.5rem 1.2rem; font-size:1rem;}
-    #errors{color:#b60000; margin:1rem 0;}
-    #results{margin-top:1.5rem; line-height:1.6;}
-    canvas{max-width:800px; margin-top:2rem;}
+    label{display:block; margin:.4rem 0 .2rem;}
+    input[type=number]{width:7rem; padding:.3rem;}
+    button{padding:.45rem .9rem; margin:.2rem .15rem;}
+    #errors{color:#b60000; margin:.8rem 0;}
+    #results{margin:1rem 0; line-height:1.5;}
+    canvas{max-width:800px; margin-top:1.5rem;}
   </style>
 </head>
 <body>
-  <h1>Cryogenic Pipe Cool-down Estimator</h1>
-
+  <h1>Cryogenic Pipe Cool-down Simulator</h1>
   <div id="errors"></div>
 
-  <label>Pipe length (m)<input id="L"        type="number" value="100" step="1"></label>
-  <label>Outer diameter (mm)<input id="OD"   type="number" value="168" step="1"></label>
-  <label>Wall thickness (mm)<input id="t"    type="number" value="3.4" step="0.1"></label>
-  <label>Initial temp (°C)<input id="T0"     type="number" value="20" step="1"></label>
-  <label>Target temp (°C)<input id="Ttarget" type="number" value="-150" step="1"></label>
-  <label>N₂ inlet temp (°C)<input id="TN2"   type="number" value="-196" step="1"></label>
-  <label>N₂ flow (Nm³/h)<input id="VN2"     type="number" value="1000" step="10"></label>
-  <label>Ambient temp (°C)<input id="Tamb"  type="number" value="20" step="1"></label>
-  <label>Overall U-value (W/m²K)<input id="U" type="number" value="1.0" step="0.1"></label>
-  <label>Heat-exchange efficiency %<input id="eta" type="number" value="70" step="1" min="1" max="100"></label>
-<!-- add directly under the existing inputs -->
-<fieldset>
-  <legend>Interactive run</legend>
-  <label>Step size (s)<input id="stepSize" type="number" value="10" min="1" max="300"></label>
-  <label>Playback speed
-        <input id="speed" type="range" min="0" max="200" value="50">
-        <span id="speedVal">1×</span></label>
-  <button id="playBtn">▶ Play</button>
-  <button id="resetBtn">⏹ Reset</button>
-</fieldset>
+  <!-- ===== INPUTS ===== -->
+  <label>Pipe length (m)          <input id="L"       type="number" value="100"></label>
+  <label>Outer diameter (mm)      <input id="OD"      type="number" value="168"></label>
+  <label>Wall thickness (mm)      <input id="t"       type="number" value="3.4"></label>
+  <label>Initial temp (°C)        <input id="T0"      type="number" value="20"></label>
+  <label>Target temp (°C)         <input id="Ttarget" type="number" value="-150"></label>
+  <label>N₂ inlet temp (°C)       <input id="TN2"     type="number" value="-196"></label>
+  <label>N₂ flow (Nm³/h)          <input id="VN2"     type="number" value="1000"></label>
+  <label>Ambient temp (°C)        <input id="Tamb"    type="number" value="20"></label>
+  <label>Overall U-value (W/m²K)  <input id="U"       type="number" value="1.0"></label>
+  <label>Efficiency (%)           <input id="eta"     type="number" value="70" min="1" max="100"></label>
 
-<!-- we keep the old “Run calculation” button for a single-shot -->
-<hr>
-<div id="results"></div>
-<canvas id="chart"></canvas>
-  <button id="run">Run calculation</button>
+  <!-- ===== RUN CONTROL ===== -->
+  <fieldset>
+    <legend>Run control</legend>
+    <label>Step size (s) <input id="stepSize" type="number" value="10" min="1" max="300"></label>
+    <label>Playback speed
+      <input id="speed" type="range" min="10" max="400" value="100">
+      <span id="speedLbl">1×</span>
+    </label>
+    <button id="playBtn">▶ Play</button>
+    <button id="pauseBtn">❚❚ Pause</button>
+    <button id="resetBtn">⏹ Reset</button>
+  </fieldset>
 
-  <div id="results"></div>
+  <!-- ===== OUTPUT ===== -->
+  <div id="results">Press Reset to initialise</div>
   <canvas id="chart"></canvas>
 
-  <script type="module" src="app.js"></script>
+  <!-- ===== Chart.js CDN ===== -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+  <!-- ===== APPLICATION ===== -->
+  <script>
+    // ---------- constants ----------
+    const RHO_STEEL = 8000;          // kg/m³
+    const RHO_N2    = 1.250;         // kg/Nm³  (0 °C, 1 atm)
+    const CP_N2     = 1040;          // J/kgK
+    const DEG_2_K   = 273.15;
+
+    // ---------- steel Cp ----------
+    function CpSteel(TK){
+      const t = TK/100;
+      return 100*(2.716 + 9.146*t - 14.08*t*t + 9.369*t*t*t - 1.916*t*t*t*t);
+    }
+
+    // ---------- DOM ----------
+    const $ = id=>document.getElementById(id);
+    function read(id){
+      const v = parseFloat($(id).value);
+      if(!isFinite(v)) throw new Error(`Invalid number in ${id}`);
+      return v;
+    }
+
+    // ---------- simulation ----------
+    class Sim{
+      constructor(){
+        this.tStep = read('stepSize');
+        this.time  = 0;
+        this.Tpipe = read('T0') + DEG_2_K;
+        this.Ttarget = read('Ttarget') + DEG_2_K;
+        this.Tn2   = read('TN2')  + DEG_2_K;
+        this.Tamb  = read('Tamb') + DEG_2_K;
+        this.U     = read('U');
+        this.eta   = read('eta')/100;
+        this.VN2_h = read('VN2');
+        this.mDotN2= (this.VN2_h * RHO_N2)/3600;
+
+        const L=read('L'), OD=read('OD')*1e-3, t=read('t')*1e-3, ID=OD-2*t;
+        if(ID<=0) throw new Error('Negative inner diameter');
+        const Asteel = Math.PI/4*(OD*OD - ID*ID);
+        this.mSteel = Asteel * L * RHO_STEEL;
+        this.Aouter = Math.PI * OD * L;
+
+        this.series = {time:[0], temp:[this.Tpipe - DEG_2_K]};
+        this.running= false;
+        this.raf    = null;
+      }
+      step(){
+        if(this.Tpipe <= this.Ttarget) return false;
+        const cp = CpSteel(this.Tpipe);
+        const Qcool = this.mDotN2 * CP_N2 * (this.Tpipe - this.Tn2) * this.eta;
+        const Qingress = this.U * this.Aouter * (this.Tamb - this.Tpipe);
+        const Qnet = Qcool - Qingress;
+        if(Qnet <= 0) throw new Error('Stall: heat ingress ≥ cooling power');
+        const dE = Qnet * this.tStep;
+        const dT = dE / (this.mSteel * cp);
+        this.Tpipe -= dT;
+        this.time  += this.tStep;
+        this.series.time.push(this.time/3600);
+        this.series.temp.push(this.Tpipe - DEG_2_K);
+        return true;
+      }
+      play(){
+        if(this.running) return;
+        this.running = true;
+        const spd = Math.max(1, Math.round($('speed').value/100));
+        const tick = ()=>{
+          if(!this.running) return;
+          for(let i=0;i<spd;i++) this.step();
+          updateChart(this.series);
+          $('results').textContent =
+            `Time: ${(this.time/3600).toFixed(2)} h | Temp: ${(this.Tpipe-DEG_2_K).toFixed(1)} °C`;
+          if(this.Tpipe <= this.Ttarget){ this.pause(); return; }
+          this.raf = requestAnimationFrame(tick);
+        };
+        tick();
+      }
+      pause(){ this.running=false; cancelAnimationFrame(this.raf); }
+      reset(){
+        this.pause();
+        // rebuild completely
+        const oldStep = read('stepSize');
+        const oldSpeed= $('speed').value;
+        Object.assign(this, new Sim());
+        $('stepSize').value = oldStep;
+        $('speed').value    = oldSpeed;
+        $('speedLbl').textContent = (oldSpeed/100).toFixed(1)+'×';
+        updateChart(this.series);
+        $('results').textContent = 'Ready – press Play';
+      }
+    }
+
+    // ---------- chart ----------
+    let chart;
+    function updateChart(series){
+      const ctx = $('chart');
+      if(chart) chart.destroy();
+      chart = new Chart(ctx,{
+        type:'line',
+        data:{
+          labels:series.time,
+          datasets:[{
+            label:'Pipe temp (°C)',
+            data:series.temp,
+            borderColor:'#005faf',
+            fill:false,
+            tension:0.2,
+            pointRadius:0
+          }]
+        },
+        options:{
+          animation:false,
+          plugins:{legend:{display:true}},
+          scales:{
+            x:{title:{display:true,text:'Time (h)'}},
+            y:{title:{display:true,text:'Temperature (°C)'}}
+          }
+        }
+      });
+    }
+
+    // ---------- controls ----------
+    let sim;
+    $('resetBtn').onclick = ()=> { sim = new Sim(); };
+    $('playBtn').onclick  = ()=> { if(!sim) sim=new Sim(); sim.play(); };
+    $('pauseBtn').onclick = ()=> { if(sim) sim.pause(); };
+    $('speed').oninput    = ()=> $('speedLbl').textContent = ($('speed').value/100).toFixed(1)+'×';
+
+    // ---------- start ----------
+    sim = new Sim();
+  </script>
 </body>
 </html>
