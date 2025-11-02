@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Cryo-Pipe Cool-down Calculator</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    body{font-family:system-ui, sans-serif; margin:2rem; background:#f7f7f7;}
+    h1{margin-top:0}
+    label{display:block; margin:.5rem 0 .2rem;}
+    input[type=number]{width:8rem; padding:.3rem;}
+    button{padding:.5rem 1.2rem; font-size:1rem;}
+    #errors{color:#b60000; margin:1rem 0;}
+    #results{margin-top:1.5rem; line-height:1.6;}
+    canvas{max-width:800px; margin-top:2rem;}
+  </style>
+</head>
+<body>
+  <h1>Cryogenic Pipe Cool-down Estimator</h1>
+
+  <div id="errors"></div>
+
+  <label>Pipe length (m)<input id="L"        type="number" value="100" step="1"></label>
+  <label>Outer diameter (mm)<input id="OD"   type="number" value="168" step="1"></label>
+  <label>Wall thickness (mm)<input id="t"    type="number" value="3.4" step="0.1"></label>
+  <label>Initial temp (°C)<input id="T0"     type="number" value="20" step="1"></label>
+  <label>Target temp (°C)<input id="Ttarget" type="number" value="-150" step="1"></label>
+  <label>N₂ inlet temp (°C)<input id="TN2"   type="number" value="-196" step="1"></label>
+  <label>N₂ flow (Nm³/h)<input id="VN2"     type="number" value="1000" step="10"></label>
+  <label>Ambient temp (°C)<input id="Tamb"  type="number" value="20" step="1"></label>
+  <label>Overall U-value (W/m²K)<input id="U" type="number" value="1.0" step="0.1"></label>
+  <label>Heat-exchange efficiency %<input id="eta" type="number" value="70" step="1" min="1" max="100"></label>
+
+  <button id="run">Run calculation</button>
+
+  <div id="results"></div>
+  <canvas id="chart"></canvas>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
