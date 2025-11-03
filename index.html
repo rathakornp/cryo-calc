@@ -1,208 +1,669 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"/>
-  <title>Cryo Interactive + Flow Ramp + Pressure</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <style>
-    body{font-family:system-ui, sans-serif; margin:2rem; background:#f7f7f7;}
-    label{display:block; margin:.4rem 0 .2rem;}
-    input[type=number]{width:7rem; padding:.3rem;}
-    button{padding:.45rem .9rem; margin:.2rem .15rem;}
-    #errors{color:#b60000; margin:.8rem 0;}
-    #results{margin:1rem 0; line-height:1.5;}
-    canvas{max-width:800px; margin-top:1.5rem;}
-  </style>
-</head>
-<body>
-  <h1>Cryo Pipe + Auto-Ramp N₂ Flow + Pressure</h1>
-  <div id="errors"></div>
-
-  <!-- ===== GEOMETRY & PROCESS ===== -->
-  <label>Pipe length (m)          <input id="L"       type="number" value="100"></label>
-  <label>Outer diameter (mm)      <input id="OD"      type="number" value="168"></label>
-  <label>Wall thickness (mm)      <input id="t"       type="number" value="3.4"></label>
-  <label>Initial temp (°C)        <input id="T0"      type="number" value="20"></label>
-  <label>Target temp (°C)         <input id="Ttarget" type="number" value="-150"></label>
-  <label>N₂ inlet temp (°C)       <input id="TN2"     type="number" value="-196"></label>
-  <label>Ambient temp (°C)        <input id="Tamb"    type="number" value="20"></label>
-  <label>Overall U-value (W/m²K)  <input id="U"       type="number" value="1.0"></label>
-  <label>Efficiency (%)           <input id="eta"     type="number" value="70" min="1" max="100"></label>
-
-  <!-- ===== RUN CONTROL ===== -->
-  <fieldset>
-    <legend>Run control</legend>
-    <label>Step size (s) <input id="stepSize" type="number" value="10" min="1" max="300"></label>
-    <label>Speed
-      <input id="speed" type="range" min="10" max="400" value="100">
-      <span id="speedLbl">1×</span>
-    </label>
-    <button id="playBtn">▶ Play</button>
-    <button id="pauseBtn">❚❚ Pause</button>
-    <button id="resetBtn">⏹ Reset</button>
-  </fieldset>
-
-  <div id="results">Press Reset to initialise</div>
-  <canvas id="chart"></canvas>
-
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-  <script>
-    // --------- phys constants ---------
-    const RHO_STEEL = 8000;           // kg/m³
-    const RHO_N2    = 1.250;          // kg/Nm³
-    const CP_N2     = 1040;           // J/kgK
-    const DEG_2_K   = 273.15;
-    const R         = 8.314;          // J/mol·K
-
-    // --------- steel Cp ---------
-    function CpSteel(TK){
-      const t = TK/100;
-      return 100*(2.716 + 9.146*t - 14.08*t*t + 9.369*t*t*t - 1.916*t*t*t*t);
-    }
-
-    // --------- DOM ---------
-    const $ = id=>document.getElementById(id);
-    function read(id){
-      const v = parseFloat($(id).value);
-      if(!isFinite(v)) throw new Error(`Invalid number in ${id}`);
-      return v;
-    }
-
-    // --------- flow-rate ramp algorithm ---------
-    function flowRate(TpipeC){
-      if(TpipeC > -10) return 1000;                       // stage 1
-      if(TpipeC > -80) return Math.min(5000,  1000 + 1000*Math.floor((-10 - TpipeC)/10));
-      if(TpipeC > -110)return 5000;                       // stage 3
-      return 10000;                                       // stage 4 preserve
-    }
-
-    // --------- simulation ---------
-    class Sim{
-      constructor(){
-        this.tStep  = read('stepSize');
-        this.time   = 0;
-        this.Tpipe  = read('T0') + DEG_2_K;
-        this.Ttarget= read('Ttarget') + DEG_2_K;
-        this.Tn2    = read('TN2')  + DEG_2_K;
-        this.Tamb   = read('Tamb') + DEG_2_K;
-        this.U      = read('U');
-        this.eta    = read('eta')/100;
-
-        const L=read('L'), OD=read('OD')*1e-3, t=read('t')*1e-3, ID=OD-2*t;
-        if(ID<=0) throw new Error('Negative inner diameter');
-        const Asteel = Math.PI/4*(OD*OD - ID*ID);
-        this.mSteel = Asteel * L * RHO_STEEL;
-        this.Aouter = Math.PI * OD * L;
-        this.Vpipe  = Math.PI/4*ID*ID*L;   // m³
-
-        this.series = {
-          time:  [0],
-          temp:  [this.Tpipe - DEG_2_K],
-          flow:  [flowRate(this.Tpipe - DEG_2_K)],
-          press: [0]
-        };
-        this.molesN2 = 0;   // integrated
-        this.running = false;
-        this.raf     = null;
-      }
-      step(){
-        if(this.Tpipe <= this.Ttarget) return false;
-        const TpipeC = this.Tpipe - DEG_2_K;
-        const VN2_h  = flowRate(TpipeC);
-        const mDotN2 = (VN2_h * RHO_N2)/3600;   // kg/s
-        const cp = CpSteel(this.Tpipe);
-        const Qcool = mDotN2 * CP_N2 * (this.Tpipe - this.Tn2) * this.eta;
-        const Qingress = this.U * this.Aouter * (this.Tamb - this.Tpipe);
-        const Qnet = Qcool - Qingress;
-        if(Qnet <= 0) throw new Error('Stall: heat ingress ≥ cooling power');
-
-        const dE = Qnet * this.tStep;
-        const dT = dE / (this.mSteel * cp);
-        this.Tpipe -= dT;
-        this.time  += this.tStep;
-
-        // moles injected this step
-        const molStep = (mDotN2 * this.tStep) / 0.028;  // kg → mol (28 g/mol)
-        this.molesN2 += molStep;
-        // ideal-gas pressure (T in K, V in m³ → Pa)
-        const P_pa = (this.molesN2 * R * this.Tpipe) / this.Vpipe;
-        const P_bar = P_pa / 1e5;
-
-        this.series.time.push(this.time/3600);
-        this.series.temp.push(this.Tpipe - DEG_2_K);
-        this.series.flow.push(VN2_h);
-        this.series.press.push(P_bar);
-        return true;
-      }
-      play(){
-        if(this.running) return;
-        this.running = true;
-        const spd = Math.max(1, Math.round($('speed').value/100));
-        const tick = ()=>{
-          if(!this.running) return;
-          for(let i=0;i<spd;i++) this.step();
-          updateChart(this.series);
-          $('results').innerHTML =
-            `Time: ${(this.time/3600).toFixed(2)} h<br>` +
-            `Temp: ${(this.Tpipe-DEG_2_K).toFixed(1)} °C<br>` +
-            `Flow: ${this.series.flow[this.series.flow.length-1]} Nm³/h<br>` +
-            `Pressure: ${this.series.press[this.series.press.length-1].toFixed(2)} bar`;
-          if(this.Tpipe <= this.Ttarget){ this.pause(); return; }
-          this.raf = requestAnimationFrame(tick);
-        };
-        tick();
-      }
-      pause(){ this.running=false; cancelAnimationFrame(this.raf); }
-      reset(){
-        this.pause();
-        const oldStep = read('stepSize');
-        const oldSpeed= $('speed').value;
-        Object.assign(this, new Sim());
-        $('stepSize').value = oldStep;
-        $('speed').value    = oldSpeed;
-        $('speedLbl').textContent = (oldSpeed/100).toFixed(1)+'×';
-        updateChart(this.series);
-        $('results').innerHTML = 'Ready – press Play';
-      }
-    }
-
-    // --------- chart ----------
-    let chart;
-    function updateChart(s){
-      const ctx = $('chart');
-      if(chart) chart.destroy();
-      chart = new Chart(ctx,{
-        type:'line',
-        data:{
-          labels:s.time,
-          datasets:[
-            {label:'Pipe temp (°C)', data:s.temp,  borderColor:'#005faf', fill:false, tension:0.2, pointRadius:0, yAxisID:'y'},
-            {label:'N₂ flow (Nm³/h)',data:s.flow, borderColor:'#e70',    fill:false, tension:0.2, pointRadius:0, yAxisID:'y1'},
-            {label:'Pressure (bar)', data:s.press,borderColor:'#080',    fill:false, tension:0.2, pointRadius:0, yAxisID:'y2'}
-          ]
-        },
-        options:{
-          animation:false,
-          plugins:{legend:{display:true}},
-          scales:{
-            x:{title:{display:true,text:'Time (h)'}},
-            y:{type:'linear', display:true, position:'left',  title:{display:true,text:'Temp (°C)'},},
-            y1:{type:'linear', display:true, position:'right', title:{display:true,text:'Flow (Nm³/h)'}, grid:{drawOnChartArea:false},},
-            y2:{type:'linear', display:false, position:'right', title:{display:true,text:'Pressure (bar)'}, grid:{drawOnChartArea:false},}
-          }
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>N2 Pipeline Cooldown Calculator</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
         }
-      });
-    }
+        /* Custom scrollbar for aesthetics */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #2d3748; /* gray-800 */
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #718096; /* gray-600 */
+            border-radius: 3px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #a0aec0; /* gray-500 */
+        }
+        /* Style for number inputs */
+        input[type="number"] {
+            -moz-appearance: textfield;
+        }
+        input[type="number"]::-webkit-outer-spin-button,
+        input[type="number"]::-webkit-inner-spin-button {
+            -webkit-appearance: none;
+            margin: 0;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-200 p-4 md:p-8">
+    <div class="max-w-7xl mx-auto">
+        <header class="mb-8">
+            <h1 class="text-3xl md:text-4xl font-bold text-center text-cyan-400">Rate-Controlled N2 Cooldown Calculator</h1>
+            <p class="text-center text-lg text-gray-400 mt-2">Simulate cooldown based on thermal rate limits and stepped N2 flow capacity.</p>
+        </header>
 
-    // --------- controls ----------
-    let sim;
-    $('resetBtn').onclick = ()=> { sim = new Sim(); };
-    $('playBtn').onclick  = ()=> { if(!sim) sim=new Sim(); sim.play(); };
-    $('pauseBtn').onclick = ()=> { if(sim) sim.pause(); };
-    $('speed').oninput    = ()=> $('speedLbl').textContent = ($('speed').value/100).toFixed(1)+'×';
+        <!-- Error / Warning Boxes -->
+        <div id="error-box" class="hidden bg-red-800 border border-red-600 text-red-100 px-4 py-3 rounded-lg relative mb-6 shadow-lg" role="alert">
+            <strong class="font-bold">Error:</strong>
+            <span class="block sm:inline" id="error-message"></span>
+        </div>
+        
+        <div id="warning-box" class="hidden bg-yellow-800 border border-yellow-600 text-yellow-100 px-4 py-3 rounded-lg relative mb-6 shadow-lg" role="alert">
+            <strong class="font-bold">Warning:</strong>
+            <span class="block sm:inline" id="warning-message"></span>
+        </div>
 
-    // --------- start ----------
-    sim = new Sim();
-  </script>
+        <!-- Main Grid Layout -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+            <!-- Inputs Column -->
+            <div class="lg:col-span-1 bg-gray-800 p-6 rounded-xl shadow-2xl border border-gray-700">
+                <h2 class="text-2xl font-semibold mb-6 text-white border-b border-gray-600 pb-2">Input Parameters</h2>
+                
+                <form id="cooldown-form">
+                    <!-- Pipeline Properties -->
+                    <div class="mb-6">
+                        <h3 class="text-lg font-medium text-cyan-400 mb-3">Pipeline Properties</h3>
+                        <div class="space-y-3">
+                            <div>
+                                <label for="pipe_length_m" class="block text-sm font-medium text-gray-300">Pipe Length (m)</label>
+                                <input type="number" id="pipe_length_m" value="1000" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white focus:ring-cyan-500 focus:border-cyan-500 p-2">
+                            </div>
+                            <div>
+                                <label for="pipe_od_mm" class="block text-sm font-medium text-gray-300">Outer Diameter (mm)</label>
+                                <input type="number" id="pipe_od_mm" value="219.1" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white focus:ring-cyan-500 focus:border-cyan-500 p-2">
+                            </div>
+                            <div>
+                                <label for="pipe_thickness_mm" class="block text-sm font-medium text-gray-300">Wall Thickness (mm)</label>
+                                <input type="number" id="pipe_thickness_mm" value="8.18" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white focus:ring-cyan-500 focus:border-cyan-500 p-2">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Process Conditions -->
+                    <div class="mb-6">
+                        <h3 class="text-lg font-medium text-cyan-400 mb-3">Process Conditions</h3>
+                        <div class="space-y-3">
+                            <div>
+                                <label for="T_initial_C" class="block text-sm font-medium text-gray-300">Initial Pipe Temp (°C)</label>
+                                <input type="number" id="T_initial_C" value="25" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white focus:ring-cyan-500 focus:border-cyan-500 p-2">
+                            </div>
+                            <div>
+                                <label for="T_target_C" class="block text-sm font-medium text-gray-300">Target Pipe Temp (°C)</label>
+                                <input type="number" id="T_target_C" value="-140" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white focus:ring-cyan-500 focus:border-cyan-500 p-2">
+                            </div>
+                             <div>
+                                <label for="T_ambient_C" class="block text-sm font-medium text-gray-300">Ambient Temp (°C)</label>
+                                <input type="number" id="T_ambient_C" value="25" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white focus:ring-cyan-500 focus:border-cyan-500 p-2">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Nitrogen Parameters -->
+                    <div class="mb-6">
+                        <h3 class="text-lg font-medium text-cyan-400 mb-3">N2 Vaporizer Capacity (Stepped)</h3>
+                        <div class="space-y-3">
+                            <div>
+                                <label for="T_n2_in_C" class="block text-sm font-medium text-gray-300">N2 Inlet Temp (°C)</label>
+                                <input type="number" id="T_n2_in_C" value="-150" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white focus:ring-cyan-500 focus:border-cyan-500 p-2">
+                            </div>
+                            <div>
+                                <label for="n2_flow_initial_Nm3h" class="block text-sm font-medium text-gray-300">Initial Max N2 Flow (Nm³/h)</label>
+                                <input type="number" id="n2_flow_initial_Nm3h" value="5000" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white focus:ring-cyan-500 focus:border-cyan-500 p-2">
+                            </div>
+                            <div>
+                                <label for="n2_flow_threshold_C" class="block text-sm font-medium text-gray-300">Temp Threshold (°C)</label>
+                                <input type="number" id="n2_flow_threshold_C" value="-60" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white focus:ring-cyan-500 focus:border-cyan-500 p-2" placeholder="e.g., -60">
+                            </div>
+                             <div>
+                                <label for="n2_flow_final_Nm3h" class="block text-sm font-medium text-gray-300">Final Max N2 Flow (Nm³/h)</label>
+                                <input type="number" id="n2_flow_final_Nm3h" value="10000" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white focus:ring-cyan-500 focus:border-cyan-500 p-2">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Heat Transfer -->
+                    <div>
+                        <h3 class="text-lg font-medium text-cyan-400 mb-3">Heat Transfer & Constraints</h3>
+                        <div class="space-y-3">
+                            <div>
+                                <label for="u_value_W_m2K" class="block text-sm font-medium text-gray-300">Overall Heat Transfer (U) (W/m²·K)</label>
+                                <input type="number" id="u_value_W_m2K" value="5" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white focus:ring-cyan-500 focus:border-cyan-500 p-2">
+                            </div>
+                            <div>
+                                <label for="efficiency_pct" class="block text-sm font-medium text-gray-300">Cooldown Efficiency (%)</label>
+                                <input type="number" id="efficiency_pct" value="90" min="1" max="100" class="mt-1 block w-full bg-gray-700 border-gray-600 rounded-md shadow-sm text-white focus:ring-cyan-500 focus:border-cyan-500 p-2">
+                            </div>
+                            <div>
+                                <label for="max_cooldown_rate_C_hr" class="block text-sm font-medium text-gray-300 font-bold text-yellow-300">Cooldown Rate Limit (°C/hr)</label>
+                                <input type="number" id="max_cooldown_rate_C_hr" value="10" class="mt-1 block w-full bg-gray-700 border-yellow-500 rounded-md shadow-sm text-white focus:ring-yellow-500 focus:border-yellow-500 p-2">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Calculate Button -->
+                    <div class="mt-8">
+                        <button type="submit" class="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-bold py-3 px-4 rounded-lg shadow-lg transition duration-300 ease-in-out transform hover:-translate-y-0.5">
+                            Run Calculation
+                        </button>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Outputs Column -->
+            <div class="lg:col-span-2 space-y-6">
+                
+                <!-- Results & Charts -->
+                <div class="bg-gray-800 p-6 rounded-xl shadow-2xl border border-gray-700">
+                    <h2 class="text-2xl font-semibold mb-4 text-white border-b border-gray-600 pb-2">Cooldown Results</h2>
+                    
+                    <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+                        
+                        <!-- Key Metrics -->
+                        <div class="xl:col-span-1 space-y-4">
+                            <h3 class="text-lg font-medium text-cyan-400 mb-2">Key Metrics</h3>
+                            <div class="bg-gray-900 p-4 rounded-lg border border-gray-700">
+                                <div class="text-sm text-gray-400 mb-1">Total Cooldown Time</div>
+                                <div id="out-time" class="text-3xl font-bold text-cyan-300">--</div>
+                                <div class="text-sm text-gray-500">hours</div>
+                            </div>
+                            <div class="bg-gray-900 p-4 rounded-lg border border-gray-700">
+                                <div class="text-sm text-gray-400 mb-1">Total N2 Required (Nm³)</div>
+                                <div id="out-n2-total-nm3" class="text-2xl font-bold text-white">--</div>
+                                <div class="text-sm text-gray-500">Nm³</div>
+                            </div>
+                            <div class="bg-gray-900 p-4 rounded-lg border border-gray-700">
+                                <div class="text-sm text-gray-400 mb-1">Total N2 Required (kg)</div>
+                                <div id="out-n2-total-kg" class="text-2xl font-bold text-white">--</div>
+                                <div class="text-sm text-gray-500">kg</div>
+                            </div>
+                            <div class="bg-gray-900 p-4 rounded-lg border border-yellow-700">
+                                <div class="text-sm text-yellow-400 mb-1">Peak Cooldown Rate</div>
+                                <div id="out-max-rate" class="text-2xl font-bold text-yellow-300">--</div>
+                                <div class="text-sm text-gray-500">°C / hour</div>
+                            </div>
+                        </div>
+
+                        <!-- Chart 1: Temperature -->
+                        <div class="xl:col-span-2 h-80 md:h-96 bg-gray-900 p-4 rounded-lg border border-gray-700">
+                            <canvas id="cooldownChart"></canvas>
+                        </div>
+
+                        <!-- Chart 2: N2 Flow Rate (NEW) -->
+                        <div class="xl:col-span-3 h-80 md:h-96 bg-gray-900 p-4 rounded-lg border border-gray-700 mt-6">
+                             <h3 class="text-lg font-medium text-cyan-400 mb-4 text-center">Required N2 Flow Rate vs. Time</h3>
+                            <canvas id="flowChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Properties -->
+                <div class="bg-gray-800 p-6 rounded-xl shadow-2xl border border-gray-700">
+                    <h2 class="text-2xl font-semibold mb-4 text-white border-b border-gray-600 pb-2">Calculated Properties</h2>
+                    <ul class="space-y-2">
+                        <li class="flex justify-between bg-gray-700 p-2 rounded">
+                            <span class="text-gray-400">Pipe Mass (SS304):</span>
+                            <span id="out-pipe-mass" class="font-medium text-gray-100">-- kg</span>
+                        </li>
+                        <li class="flex justify-between bg-gray-700 p-2 rounded">
+                            <span class="text-gray-400">Pipe External Surface Area:</span>
+                            <span id="out-pipe-area" class="font-medium text-gray-100">-- m²</span>
+                        </li>
+                        <li class="flex justify-between bg-gray-700 p-2 rounded">
+                            <span class="text-gray-400">Total Heat Removed (Pipe):</span>
+                            <span id="out-heat-pipe" class="font-medium text-gray-100">-- MJ</span>
+                        </li>
+                        <li class="flex justify-between bg-gray-700 p-2 rounded">
+                            <span class="text-gray-400">Total Heat Ingress (Ambient):</span>
+                            <span id="out-heat-ingress" class="font-medium text-gray-100">-- MJ</span>
+                        </li>
+                        <li class="flex justify-between bg-gray-900 p-2 rounded border border-cyan-700 mt-2">
+                            <span class="text-cyan-300 font-medium">Theoretical Stall Temp (at Final Max Flow):</span>
+                            <span id="out-stall-temp" class="font-bold text-cyan-300">-- °C</span>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- Constants ---
+        const DENSITY_SS304_KGM3 = 8000;      // kg/m³
+        const DENSITY_N2_NORMAL_KGNM3 = 1.25; // kg/Nm³
+        const CP_N2_GAS_JKGK = 1040;          // J/kg·K (Assumed constant)
+
+        // --- Utility Functions ---
+        
+        function C_to_K(tempC) {
+            return tempC + 273.15;
+        }
+
+        function getCp_SS304(tempK) {
+            // Data: (80K, 200), (100K, 250), (200K, 440), (300K, 500)
+            if (tempK <= 80) return 200;
+            if (tempK <= 100) return 200 + (tempK - 80) * (250 - 200) / (100 - 80); // 2.5 J/K
+            if (tempK <= 200) return 250 + (tempK - 100) * (440 - 250) / (200 - 100); // 1.9 J/K
+            if (tempK <= 300) return 440 + (tempK - 200) * (500 - 440) / (300 - 200); // 0.6 J/K
+            return 500;
+        }
+
+        function format(num, decimals) {
+            if (isNaN(num) || num === null) return "--";
+            return num.toFixed(decimals);
+        }
+
+        function convert_flow_to_kgs(flow_Nm3h) {
+            return (flow_Nm3h * DENSITY_N2_NORMAL_KGNM3) / 3600.0;
+        }
+
+        function convert_flow_to_Nm3h(flow_kgs) {
+            return (flow_kgs * 3600.0) / DENSITY_N2_NORMAL_KGNM3;
+        }
+
+        // --- Charts ---
+        let cooldownChart = null;
+        let flowChart = null;
+
+        /**
+         * Initializes or updates the Chart.js chart.
+         * @param {string} canvasId - The ID of the canvas element
+         * @param {number[]} timeData - Array of time data (hours)
+         * @param {number[]} yData - Array of Y-axis data
+         * @param {string} yLabel - Label for the Y-axis
+         * @param {string} color - Chart color
+         * @param {string} yTooltipLabel - Label for the tooltip
+         * @returns {Chart} The new Chart instance
+         */
+        function initializeChart(canvasId, timeData, yData, yLabel, color, yTooltipLabel) {
+            const ctx = document.getElementById(canvasId).getContext('2d');
+            
+            return new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: timeData,
+                    datasets: [{
+                        label: yLabel,
+                        data: yData,
+                        borderColor: color,
+                        backgroundColor: `${color}1A`, // '1A' for ~10% opacity
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        tension: 0.1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            title: {
+                                display: true,
+                                text: 'Time (hours)',
+                                color: '#9ca3af' // gray-400
+                            },
+                            ticks: {
+                                color: '#d1d5db' // gray-300
+                            },
+                            grid: {
+                                color: '#4b5563' // gray-700
+                            }
+                        },
+                        y: {
+                            title: {
+                                display: true,
+                                text: yLabel,
+                                color: '#9ca3af'
+                            },
+                            ticks: {
+                                color: '#d1d5db'
+                            },
+                            grid: {
+                                color: '#4b5563'
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: false
+                        },
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false,
+                            callbacks: {
+                                title: function(tooltipItems) {
+                                    return `Time: ${format(tooltipItems[0].parsed.x, 2)} hrs`;
+                                },
+                                label: function(tooltipItem) {
+                                    return `${yTooltipLabel}: ${format(tooltipItem.parsed.y, 2)}`;
+                                }
+                            }
+                        }
+                    },
+                    interaction: {
+                        mode: 'nearest',
+                        axis: 'x',
+                        intersect: false
+                    }
+                }
+            });
+        }
+
+        function destroyCharts() {
+            if (cooldownChart) {
+                cooldownChart.destroy();
+                cooldownChart = null;
+            }
+            if (flowChart) {
+                flowChart.destroy();
+                flowChart = null;
+            }
+        }
+
+        function plotCharts(timeData, tempData, flowData) {
+            destroyCharts(); // Clear existing charts
+            
+            // Chart 1: Temperature vs. Time
+            cooldownChart = initializeChart('cooldownChart', timeData, tempData, 'Temperature (°C)', '#22d3ee', 'Temp');
+            
+            // Chart 2: Flow Rate vs. Time
+            flowChart = initializeChart('flowChart', timeData, flowData, 'N2 Flow Rate (Nm³/h)', '#facc15', 'Flow');
+        }
+
+
+        // --- UI Feedback ---
+        const errorBox = document.getElementById('error-box');
+        const errorMessage = document.getElementById('error-message');
+        const warningBox = document.getElementById('warning-box');
+        const warningMessage = document.getElementById('warning-message');
+
+        function showError(message) {
+            errorMessage.innerText = message;
+            errorBox.classList.remove('hidden');
+            warningBox.classList.add('hidden'); // Hide warning if error
+        }
+
+        function showWarning(message) {
+            warningMessage.innerText = message;
+            warningBox.classList.remove('hidden');
+        }
+
+        function clearMessages() {
+            errorBox.classList.add('hidden');
+            warningBox.classList.add('hidden');
+        }
+
+        // --- Main Calculation ---
+        document.getElementById('cooldown-form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            clearMessages();
+            
+            try {
+                runCalculation();
+            } catch (error) {
+                showError(`An unexpected error occurred: ${error.message}`);
+                console.error(error);
+            }
+        });
+
+        function runCalculation() {
+            // 1. Get and parse all inputs
+            const inputs = {
+                pipe_length_m: parseFloat(document.getElementById('pipe_length_m').value),
+                pipe_od_mm: parseFloat(document.getElementById('pipe_od_mm').value),
+                pipe_thickness_mm: parseFloat(document.getElementById('pipe_thickness_mm').value),
+                T_initial_C: parseFloat(document.getElementById('T_initial_C').value),
+                T_target_C: parseFloat(document.getElementById('T_target_C').value),
+                T_ambient_C: parseFloat(document.getElementById('T_ambient_C').value),
+                T_n2_in_C: parseFloat(document.getElementById('T_n2_in_C').value),
+                n2_flow_initial_Nm3h: parseFloat(document.getElementById('n2_flow_initial_Nm3h').value),
+                n2_flow_threshold_C: parseFloat(document.getElementById('n2_flow_threshold_C').value),
+                n2_flow_final_Nm3h: parseFloat(document.getElementById('n2_flow_final_Nm3h').value),
+                u_value_W_m2K: parseFloat(document.getElementById('u_value_W_m2K').value),
+                efficiency_pct: parseFloat(document.getElementById('efficiency_pct').value),
+                max_cooldown_rate_C_hr: parseFloat(document.getElementById('max_cooldown_rate_C_hr').value)
+            };
+
+            // 2. Validate inputs
+            for (const [key, value] of Object.entries(inputs)) {
+                if (isNaN(value)) {
+                    showError(`Invalid input for "${key}". Please enter a valid number.`);
+                    return;
+                }
+            }
+
+            if (inputs.T_initial_C <= inputs.T_target_C) {
+                showError("Initial temperature must be warmer than the target temperature.");
+                return;
+            }
+            if (inputs.T_target_C <= inputs.T_n2_in_C) {
+                showError("Target temperature must be warmer than the N2 inlet temperature.");
+                return;
+            }
+            if (inputs.n2_flow_threshold_C >= inputs.T_initial_C || inputs.n2_flow_threshold_C <= inputs.T_target_C) {
+                showError("N2 flow threshold temperature must be between the initial and target temperatures.");
+                return;
+            }
+            if (inputs.efficiency_pct < 1 || inputs.efficiency_pct > 100) {
+                showError("Efficiency must be between 1 and 100.");
+                return;
+            }
+            if (inputs.max_cooldown_rate_C_hr <= 0) {
+                showError("Max Cooldown Rate must be a positive number.");
+                return;
+            }
+
+            // 3. Pre-Calculations
+            const pipe_od_m = inputs.pipe_od_mm / 1000.0;
+            const pipe_thickness_m = inputs.pipe_thickness_mm / 1000.0;
+            const pipe_id_m = pipe_od_m - (2 * pipe_thickness_m);
+
+            if (pipe_id_m <= 0) {
+                showError("Pipe thickness is too large for the given outer diameter.");
+                return;
+            }
+
+            const area_outer_ring_m2 = Math.PI * (pipe_od_m / 2)**2;
+            const area_inner_ring_m2 = Math.PI * (pipe_id_m / 2)**2;
+            const area_cross_section_m2 = area_outer_ring_m2 - area_inner_ring_m2;
+            
+            const volume_pipe_m3 = area_cross_section_m2 * inputs.pipe_length_m;
+            const mass_pipe_kg = volume_pipe_m3 * DENSITY_SS304_KGM3;
+            const area_surface_m2 = Math.PI * pipe_od_m * inputs.pipe_length_m;
+
+            // N2 flow rates
+            const flow_initial_kgs = convert_flow_to_kgs(inputs.n2_flow_initial_Nm3h);
+            const flow_final_kgs = convert_flow_to_kgs(inputs.n2_flow_final_Nm3h);
+
+            // Temperatures in Kelvin
+            const T_initial_K = C_to_K(inputs.T_initial_C);
+            const T_target_K = C_to_K(inputs.T_target_C);
+            const T_ambient_K = C_to_K(inputs.T_ambient_C);
+            const T_n2_in_K = C_to_K(inputs.T_n2_in_C);
+            const T_threshold_K = C_to_K(inputs.n2_flow_threshold_C);
+            
+            const efficiency_factor = inputs.efficiency_pct / 100.0;
+            const max_rate_K_s = inputs.max_cooldown_rate_C_hr / 3600.0; // K/s
+
+            // --- Calculate theoretical stall temperature ---
+            const A = flow_final_kgs * CP_N2_GAS_JKGK * efficiency_factor;
+            const B = inputs.u_value_W_m2K * area_surface_m2;
+            let T_stall_K;
+
+            if (A + B <= 0) {
+                T_stall_K = T_ambient_K;
+            } else {
+                T_stall_K = (B * T_ambient_K + A * T_n2_in_K) / (A + B);
+            }
+            const T_stall_C = T_stall_K - 273.15;
+            
+            document.getElementById('out-stall-temp').innerText = `${format(T_stall_C, 1)} °C`;
+
+            if (inputs.T_target_C <= T_stall_C) {
+                showError(`Target temperature (${inputs.T_target_C}°C) is at or below the theoretical stall temperature of ${format(T_stall_C, 1)}°C (based on the final max flow). The target is unreachable.`);
+                
+                // Reset metrics
+                document.getElementById('out-time').innerText = "--";
+                document.getElementById('out-n2-total-nm3').innerText = "--";
+                document.getElementById('out-n2-total-kg').innerText = "--";
+                document.getElementById('out-heat-pipe').innerText = "--";
+                document.getElementById('out-heat-ingress').innerText = "--";
+                document.getElementById('out-max-rate').innerText = "--";
+                plotCharts([], [], []);
+                
+                document.getElementById('out-pipe-mass').innerText = `${format(mass_pipe_kg, 0)} kg`;
+                document.getElementById('out-pipe-area').innerText = `${format(area_surface_m2, 0)} m²`;
+                return;
+            }
+
+            // 4. Run the transient simulation
+            
+            const dt_s = 60; 
+            const maxIterations = 500000; 
+
+            let currentTime_s = 0;
+            let currentTemp_K = T_initial_K;
+            let totalHeatRemoved_J = 0;
+            let totalHeatIngress_J = 0;
+            let totalN2_kg = 0; 
+            let max_rate_achieved_C_hr = 0; 
+
+            const timeData = [0];
+            const tempData = [inputs.T_initial_C];
+            const flowData = [0]; // Track N2 flow rate
+
+            let i = 0;
+            let calculationStalled = false;
+            let last_dT_K = 0; // For rate check
+
+            while (currentTemp_K > T_target_K && i < maxIterations) {
+                
+                // a) Get pipe specific heat at current temp
+                const cp_pipe_J_kgK = getCp_SS304(currentTemp_K);
+
+                // b) Calculate heat ingress (Q_ingress)
+                const deltaT_ambient = T_ambient_K - currentTemp_K;
+                const q_ingress_W = inputs.u_value_W_m2K * area_surface_m2 * deltaT_ambient;
+
+                // --- NEW "RATE-CONTROL" LOGIC ---
+                // c) Calculate max net removal power allowed by the rate limit
+                // q_net = (dT/dt) * m * Cp
+                const q_net_max_W = (max_rate_K_s) * mass_pipe_kg * cp_pipe_J_kgK;
+
+                // d) Calculate max cooling power allowed
+                // q_cooling = q_net + q_ingress
+                const q_cooling_max_W = q_net_max_W + q_ingress_W;
+
+                // e) Calculate N2 mass flow required for this max cooling
+                // q_cooling = m_flow * Cp_N2 * deltaT_n2 * eff
+                // m_flow = q_cooling / (Cp_N2 * deltaT_n2 * eff)
+                const deltaT_n2_eff = (currentTemp_K - T_n2_in_K) * efficiency_factor;
+                let mass_flow_allowed_kgs = 0;
+                if (deltaT_n2_eff > 0) {
+                     mass_flow_allowed_kgs = q_cooling_max_W / (CP_N2_GAS_JKGK * deltaT_n2_eff);
+                }
+
+                // f) Get max available flow from vaporizer (stepped)
+                const mass_flow_available_kgs = (currentTemp_K > T_threshold_K) ? flow_initial_kgs : flow_final_kgs;
+
+                // g) Select the flow to use: the MINIMUM of what's allowed and what's available
+                const current_mass_flow_kgs = Math.min(mass_flow_allowed_kgs, mass_flow_available_kgs);
+                // --- END NEW LOGIC ---
+
+                // h) Calculate ACTUAL cooling power based on the (potentially limited) flow
+                const q_cooling_W = current_mass_flow_kgs * CP_N2_GAS_JKGK * deltaT_n2_eff;
+
+                // i) Calculate ACTUAL net cooling power
+                const q_net_removal_W = q_cooling_W - q_ingress_W;
+                
+                if (q_net_removal_W <= 0 && i > 0) { // Check i > 0 to allow first step
+                    calculationStalled = true;
+                    showError(`Calculation stalled at ${format(currentTemp_K - 273.15, 1)}°C. This is near the theoretical stall temperature. Heat ingress is now equal to N2 cooling capacity.`);
+                    break;
+                }
+
+                // j) Calculate temperature drop
+                const energy_removed_J = q_net_removal_W * dt_s;
+                const dT_K = energy_removed_J / (mass_pipe_kg * cp_pipe_J_kgK);
+                
+                // k) Check actual cooldown rate
+                const current_rate_C_hr = (dT_K * 3600.0) / dt_s; 
+                if (current_rate_C_hr > max_rate_achieved_C_hr) {
+                    max_rate_achieved_C_hr = current_rate_C_hr;
+                }
+                last_dT_K = dT_K; // Store for next loop
+
+                // l) Update state for next loop
+                currentTemp_K -= dT_K;
+                currentTime_s += dt_s;
+                
+                // Update totals
+                totalHeatRemoved_J += (q_cooling_W * dt_s);
+                totalHeatIngress_J += (q_ingress_W * dt_s);
+                totalN2_kg += (current_mass_flow_kgs * dt_s);
+
+                // Store data point for chart
+                const current_flow_Nm3h = convert_flow_to_Nm3h(current_mass_flow_kgs);
+                if (i % 10 === 0) { // Sample every 10 minutes for chart
+                    timeData.push(currentTime_s / 3600.0);
+                    tempData.push(currentTemp_K - 273.15);
+                    flowData.push(current_flow_Nm3h);
+                }
+                
+                // Store first flow rate
+                if (i === 0) {
+                    flowData[0] = current_flow_Nm3h;
+                }
+                
+                i++;
+            }
+
+            // Add final data point
+            timeData.push(currentTime_s / 3600.0);
+            tempData.push(currentTemp_K - 273.15);
+            flowData.push(convert_flow_to_Nm3h(current_mass_flow_kgs));
+
+            // 5. Check for calculation failures
+            if (i >= maxIterations) {
+                showError("Calculation timed out after maximum iterations. Check parameters. Cooldown may be extremely slow.");
+                return;
+            }
+            if (calculationStalled) {
+                return; // Error already shown
+            }
+            
+            // 6. Check for cooldown rate warning (slight overshoot is possible due to Cp model)
+            if (max_rate_achieved_C_hr > (inputs.max_cooldown_rate_C_hr * 1.01)) { // Allow 1% overshoot
+                showWarning(`Peak cooldown rate of ${format(max_rate_achieved_C_hr, 1)} °C/hr slightly exceeded the limit of ${inputs.max_cooldown_rate_C_hr} °C/hr. This can happen at flow step-up points.`);
+            }
+
+            // 7. Display final results
+            const total_time_hrs = currentTime_s / 3600.0;
+            const total_n2_Nm3 = totalN2_kg / DENSITY_N2_NORMAL_KGNM3;
+            const total_heat_removed_MJ = (totalHeatRemoved_J - totalHeatIngress_J) / 1_000_000.0; 
+            const total_heat_ingress_MJ = totalHeatIngress_J / 1_000_000.0;
+
+            document.getElementById('out-time').innerText = format(total_time_hrs, 2);
+            document.getElementById('out-n2-total-nm3').innerText = format(total_n2_Nm3, 0);
+            document.getElementById('out-n2-total-kg').innerText = format(totalN2_kg, 0);
+            document.getElementById('out-max-rate').innerText = `${format(max_rate_achieved_C_hr, 1)}`;
+
+            document.getElementById('out-pipe-mass').innerText = `${format(mass_pipe_kg, 0)} kg`;
+            document.getElementById('out-pipe-area').innerText = `${format(area_surface_m2, 0)} m²`;
+            document.getElementById('out-heat-pipe').innerText = `${format(total_heat_removed_MJ, 1)} MJ`;
+            document.getElementById('out-heat-ingress').innerText = `${format(total_heat_ingress_MJ, 1)} MJ`;
+            
+            // 8. Plot charts
+            plotCharts(timeData, tempData, flowData);
+        }
+
+        // Initial plot on load
+        plotCharts([], [], []);
+
+    </script>
 </body>
 </html>
+
